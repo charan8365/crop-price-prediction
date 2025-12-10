@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy
+numpy==1.24.4
 joblib
 prophet==1.1.4
 cmdstanpy==1.2.3
