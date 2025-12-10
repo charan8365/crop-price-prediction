@@ -1,4 +1,4 @@
-# app_streamlit_demo.py — Clean multi-crop Streamlit app
+# app_streamlit_demo.py — Clean multi-crop Streamlit app (with robust fallback to CSV forecasts)
 import streamlit as st
 import pandas as pd
 import joblib
@@ -58,80 +58,109 @@ try:
 except Exception:
     st.warning("Could not draw price chart — check date/modal_price columns.")
 
-# --- Load model for selected crop ---
+# -------------------------
+# MODEL + FORECAST (robust)
+# -------------------------
+
+# Try to load model; if it fails, fallback to loading precomputed forecast CSVs
+model = None
 model_path = f"models/prophet_{selected_crop.lower()}_All.pkl"
-if not os.path.exists(model_path):
-    st.error(f"Model not found: {model_path}. Train models in model.ipynb and save to models/")
-    st.stop()
 
-try:
-    model = joblib.load(model_path)
-except Exception as e:
-    st.error(f"Failed to load model: {e}")
-    st.stop()
-
-# identify regressors used by model
-expected_regressors = list(model.extra_regressors.keys()) if hasattr(model, "extra_regressors") and model.extra_regressors else []
-
-# Build future frame and attach regressors if needed
-future = model.make_future_dataframe(periods=days)
-
-if expected_regressors:
-    # show a quiet expander the user can open if they want regressor details
-    with st.expander("Regressor details (click to view)"):
-        st.write(f"Model expects regressors: {expected_regressors}.")
-        st.write("Regressors will be aligned to future dates and filled (ffill/bfill, then median fallback).")
-
-    # build regressor source aligned to dates
-    reg_source = df_market.rename(columns={"date":"ds"}).set_index("ds")
-    # if duplicate dates, aggregate sensible stats
-    if not reg_source.index.is_unique:
-        agg_dict = {}
-        for r in expected_regressors:
-            agg_dict[r] = "sum" if r == "arrivals" else "mean"
-        for r in expected_regressors:
-            if r not in reg_source.columns:
-                reg_source[r] = np.nan
-        reg_source = reg_source.groupby(level=0).agg(agg_dict)
-
-    # ensure regressors exist as columns
-    for r in expected_regressors:
-        if r not in reg_source.columns:
-            reg_source[r] = np.nan
-
-    # align to future dates, fill missing sensibly
-    reg_frame = reg_source[expected_regressors].reindex(future['ds']).reset_index()
-    reg_frame[expected_regressors] = reg_frame[expected_regressors].ffill().bfill()
-    for r in expected_regressors:
-        if reg_frame[r].isna().any():
-            median_val = float(reg_source[r].median(skipna=True)) if not reg_source[r].dropna().empty else 0.0
-            reg_frame[r] = reg_frame[r].fillna(median_val)
-
-    future = future.merge(reg_frame, on="ds", how="left")
+if os.path.exists(model_path):
+    try:
+        model = joblib.load(model_path)
+    except Exception as e:
+        # show error but keep app usable
+        st.error(f"Failed to load model: {e}")
+        st.warning("Model load failed on server. Falling back to precomputed CSV forecasts (results/).")
 else:
-    # quiet fallback message (less intrusive than st.info)
-    st.caption("No external regressors used for this model.")
+    st.info("No model file found on server; using precomputed CSV forecasts from results/ if available.")
 
-# Predict
-st.subheader("Forecast")
-try:
-    forecast = model.predict(future)
-except Exception as e:
-    st.error(f"Forecast failed: {e}")
-    st.stop()
+# If model loaded, attempt to forecast. Otherwise load forecast CSV from results/
+forecast = None
+if model is not None:
+    try:
+        expected_regressors = list(model.extra_regressors.keys()) if hasattr(model, "extra_regressors") and model.extra_regressors else []
+        future = model.make_future_dataframe(periods=days)
+        if expected_regressors:
+            # align regressors (same logic as used during training)
+            reg_source = df_market.rename(columns={"date":"ds"}).set_index("ds")
+            if not reg_source.index.is_unique:
+                agg_dict = {}
+                for r in expected_regressors:
+                    agg_dict[r] = "sum" if r == "arrivals" else "mean"
+                for r in expected_regressors:
+                    if r not in reg_source.columns:
+                        reg_source[r] = np.nan
+                reg_source = reg_source.groupby(level=0).agg(agg_dict)
+            for r in expected_regressors:
+                if r not in reg_source.columns:
+                    reg_source[r] = np.nan
+            reg_frame = reg_source[expected_regressors].reindex(future['ds']).reset_index()
+            reg_frame[expected_regressors] = reg_frame[expected_regressors].ffill().bfill()
+            for r in expected_regressors:
+                if reg_frame[r].isna().any():
+                    median_val = float(reg_source[r].median(skipna=True)) if not reg_source[r].dropna().empty else 0.0
+                    reg_frame[r] = reg_frame[r].fillna(median_val)
+            future = future.merge(reg_frame, on="ds", how="left")
+        forecast = model.predict(future)
+    except Exception as e:
+        st.error(f"Model forecasting failed: {e}")
+        st.warning("Falling back to precomputed forecast CSVs (results/).")
+        forecast = None
 
-# show forecast chart and table
-st.subheader(f"Forecast for next {days} days")
-try:
-    st.line_chart(forecast.set_index("ds")["yhat"].tail(days))
-except Exception:
-    st.warning("Could not draw forecast chart.")
-st.dataframe(forecast[["ds","yhat","yhat_lower","yhat_upper"]].tail(days))
+# If forecast None (no model or model failed), try loading CSVs
+if forecast is None:
+    csv_candidates = [
+        f"results/{selected_crop.lower()}_forecast_full.csv",
+        f"results/{selected_crop.lower()}_forecast_2026.csv",
+        f"results/{selected_crop.lower()}_forecast_90.csv",
+        f"results/{selected_crop.lower()}_forecast.csv",
+        "results/prophet_forecast.csv"
+    ]
+    found = False
+    for c in csv_candidates:
+        if os.path.exists(c):
+            try:
+                forecast = pd.read_csv(c, parse_dates=['ds'])
+                st.success(f"Loaded precomputed forecast: {c}")
+                found = True
+                break
+            except Exception as e:
+                st.warning(f"Could not load {c}: {e}")
+    if not found:
+        st.info("No precomputed forecast CSV found in results/. Forecasting unavailable.")
 
-# Download forecast CSV
-csv = forecast[["ds","yhat","yhat_lower","yhat_upper"]].to_csv(index=False)
-st.download_button("Download forecast CSV", data=csv, file_name=f"{selected_crop.lower()}_forecast.csv", mime="text/csv")
+# Display forecast if available
+if forecast is not None:
+    source = "model" if model is not None and 'yhat' in forecast.columns else "CSV"
+    st.subheader(f"Forecast for next {days} days (from {source})")
 
+    # Pick a sensible price column
+    price_col = None
+    for candidate in ['yhat','modal_price','y','pred','price']:
+        if candidate in forecast.columns:
+            price_col = candidate
+            break
+
+    if price_col is None:
+        st.dataframe(forecast.head(20))
+    else:
+        try:
+            st.line_chart(forecast.set_index('ds')[price_col].tail(days))
+        except Exception:
+            try:
+                st.line_chart(forecast.set_index('ds')[price_col])
+            except Exception:
+                st.write("Could not chart forecast timeseries.")
+        display_cols = [c for c in ['ds','yhat','yhat_lower','yhat_upper','modal_price','price'] if c in forecast.columns]
+        st.dataframe(forecast[display_cols].tail(days))
+else:
+    st.info("No forecast available (no model and no CSVs in results/).")
+
+# -------------------------
+# RECOMMENDATIONS DOWNLOAD
+# -------------------------
 # ---- Show Recommendations for 2026 (if generated) ----
 if st.sidebar.button("Show 2026 Crop Recommendations"):
     if os.path.exists("results/crop_recommendations_2026.csv"):
